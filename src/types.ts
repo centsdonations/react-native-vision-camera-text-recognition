@@ -101,7 +101,7 @@ export interface ScanTextOptions {
 }
 
 export type TextRecognitionPlugin = {
-  scanText: (frame: Frame, options: ScanTextOptions) => Text[];
+  scanText: (frame: Frame, scanOptions?: ScanTextOptions) => Text[];
 };
 export type TranslatorPlugin = {
   translate: (frame: Frame) => string;
