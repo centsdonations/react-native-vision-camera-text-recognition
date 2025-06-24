@@ -85,10 +85,23 @@ export type CameraTypes = {
   | { mode: 'translate'; options: TranslatorOptions }
   );;
 
+export enum ImageOrientation {
+  Up = 1,
+  Down = 2,
+  Left = 3,
+  Right = 4,
+  UpMirrored = 5,
+  DownMirrored = 6,
+  LeftMirrored = 7,
+  RightMirrored = 8,
+}
 
+export interface ScanTextOptions {
+  orientation?: ImageOrientation;
+}
 
 export type TextRecognitionPlugin = {
-  scanText: (frame: Frame) => Text[];
+  scanText: (frame: Frame, options: ScanTextOptions) => Text[];
 };
 export type TranslatorPlugin = {
   translate: (frame: Frame) => string;

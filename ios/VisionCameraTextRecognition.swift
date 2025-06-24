@@ -41,7 +41,15 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
     public override func callback(_ frame: Frame, withArguments arguments: [AnyHashable: Any]?) -> Any {
         let buffer = frame.buffer
         let image = VisionImage(buffer: buffer)
-        image.orientation = getOrientation(orientation: frame.orientation)
+
+        // Check if orientation override is provided in arguments
+        if let orientationOverride = arguments?["orientation"] as? Int,
+           let visionOrientation = imageOrientationFromInt(orientationOverride) {
+            image.orientation = visionOrientation
+        } else {
+            // Use default orientation if no override provided
+           image.orientation = getOrientation(orientation: frame.orientation)
+        }
 
         do {
             let result = try self.textRecognizer.results(in: image)
@@ -154,6 +162,21 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
           return .left
         default:
           return .up
+        }
+    }
+    
+    // Helper function to convert integer to image orientation
+    private func imageOrientationFromInt(_ orientation: Int) -> UIImage.Orientation? {
+        switch orientation {
+        case 1: return .up
+        case 2: return .down
+        case 3: return .left
+        case 4: return .right
+        case 5: return .upMirrored
+        case 6: return .downMirrored
+        case 7: return .leftMirrored
+        case 8: return .rightMirrored
+        default: return nil
         }
     }
 }

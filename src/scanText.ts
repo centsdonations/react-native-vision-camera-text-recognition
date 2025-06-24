@@ -4,6 +4,7 @@ import type {
   TextRecognitionPlugin,
   TextRecognitionOptions,
   Text,
+  ScanTextOptions,
 } from './types';
 
 const LINKING_ERROR = `Can't load plugin scanText.Try cleaning cache or reinstall plugin.`;
@@ -18,10 +19,10 @@ export function createTextRecognitionPlugin(
     throw new Error(LINKING_ERROR);
   }
   return {
-    scanText: (frame: Frame): Text[] => {
+    scanText: (frame: Frame, scanOptions?: ScanTextOptions): Text[] => {
       'worklet';
       // @ts-ignore
-      return plugin.call(frame) as Text[];
+      return plugin.call(frame, scanOptions ?? {}) as Text[];
     },
   };
 }

@@ -45,8 +45,10 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
     override fun callback(frame: Frame, arguments: Map<String, Any>?): HashMap<String, Any?>? {
         val data = WritableNativeMap()
         val mediaImage: Image = frame.image
-        val image =
-            InputImage.fromMediaImage(mediaImage, frame.imageProxy.imageInfo.rotationDegrees)
+
+        // Use the determined rotation (either default or override)
+        val image = InputImage.fromMediaImage(mediaImage, extractOrientationParameter(arguments) ?: frame.imageProxy.imageInfo.rotationDegrees)
+
         val task: Task<Text> = recognizer.process(image)
         try {
             val text: Text = Tasks.await(task)
@@ -130,6 +132,32 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
                     putInt("boundingCenterX", it.centerX())
                     putInt("boundingCenterY", it.centerY())
                 }
+            }
+        }
+
+        private fun extractOrientationParameter(arguments: Map<String, Any>?): Int? {
+            if (arguments != null && arguments.containsKey("orientation")) {
+                val orientationOverride = arguments["orientation"]
+                if (orientationOverride is Int) {
+                    // Convert the enum-style orientation to rotation degrees
+                    return imageRotationFromOrientationEnum(orientationOverride)
+                }
+            }
+            return null
+        }
+
+        // Helper function to convert orientation enum to rotation degrees
+        private fun imageRotationFromOrientationEnum(orientation: Int): Int? {
+            return when (orientation) {
+                1 -> 0      // .up -> 0 degrees
+                2 -> 180    // .down -> 180 degrees
+                3 -> 270    // .left -> 270 degrees (counterclockwise from up)
+                4 -> 90     // .right -> 90 degrees (clockwise from up)
+                5 -> 0      // .upMirrored -> 0 degrees (with horizontal flip, but ML Kit doesn't support mirroring directly)
+                6 -> 180    // .downMirrored -> 180 degrees (with horizontal flip)
+                7 -> 270    // .leftMirrored -> 270 degrees (with horizontal flip)
+                8 -> 90     // .rightMirrored -> 90 degrees (with horizontal flip)
+                else -> null
             }
         }
     }
