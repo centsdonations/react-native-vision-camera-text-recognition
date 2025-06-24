@@ -18,6 +18,7 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.mrousavy.camera.frameprocessors.Frame
 import com.mrousavy.camera.frameprocessors.FrameProcessorPlugin
 import com.mrousavy.camera.frameprocessors.VisionCameraProxy
+import java.nio.ByteBuffer
 import java.util.HashMap
 
 class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<String, Any>?) :
@@ -46,8 +47,21 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
         val data = WritableNativeMap()
         val mediaImage: Image = frame.image
 
-        // Use the determined rotation (either default or override)
-        val image = InputImage.fromMediaImage(mediaImage, extractOrientationParameter(arguments) ?: frame.imageProxy.imageInfo.rotationDegrees)
+        val rotation = extractOrientationParameter(arguments) ?: frame.imageProxy.imageInfo.rotationDegrees
+        val roi = extractRegionOfInterestParameter(arguments)
+
+        val image = if (roi != null) {
+            val croppedBuffer = cropGrayscaleFromImage(mediaImage, roi)
+            InputImage.fromByteBuffer(
+                croppedBuffer,
+                roi.width(),
+                roi.height(),
+                rotation,
+                InputImage.IMAGE_FORMAT_Y8
+            )
+        } else {
+            InputImage.fromMediaImage(mediaImage, rotation)
+        }
 
         val task: Task<Text> = recognizer.process(image)
         try {
@@ -144,6 +158,74 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
                 }
             }
             return null
+        }
+
+        private fun extractRegionOfInterestParameter(arguments: Map<String, Any>?): Rect? {
+            if (arguments == null) return null
+            val roiMap = arguments["roi"] as? Map<*, *> ?: return null
+
+            val x = (roiMap["x"] as? Number)?.toInt() ?: return null
+            val y = (roiMap["y"] as? Number)?.toInt() ?: return null
+            val width = (roiMap["width"] as? Number)?.toInt() ?: return null
+            val height = (roiMap["height"] as? Number)?.toInt() ?: return null
+
+            return Rect(x, y, x + width, y + height)
+        }
+
+        private fun cropGrayscaleFromImage(image: Image, roi: Rect): ByteBuffer {
+            val yPlane = image.planes[0]
+            val yBuffer = yPlane.buffer
+            val yRowStride = yPlane.rowStride
+            val pixelStride = yPlane.pixelStride
+
+            // Validate ROI boundaries
+            val imgWidth = image.width
+            val imgHeight = image.height
+            val validRoi = Rect(
+                max(0, roi.left),
+                max(0, roi.top),
+                min(imgWidth, roi.right),
+                min(imgHeight, roi.bottom)
+            )
+
+            val roiWidth = validRoi.width()
+            val roiHeight = validRoi.height()
+
+            // Create a properly ordered direct buffer
+            val croppedBuffer = ByteBuffer.allocateDirect(roiWidth * roiHeight)
+                .order(ByteOrder.nativeOrder())
+
+            // Create a temporary buffer for reading each row
+            val rowBuffer = ByteArray(yRowStride)
+
+            // Save original buffer position
+            val originalPos = yBuffer.position()
+
+            try {
+                for (row in 0 until roiHeight) {
+                    val rowOffset = (validRoi.top + row) * yRowStride
+
+                    // Set buffer position just once per row
+                    yBuffer.position(rowOffset)
+
+                    // Read the entire row
+                    yBuffer.get(rowBuffer, 0, min(yRowStride, yBuffer.remaining()))
+
+                    // Extract only the pixels we need, accounting for pixel stride
+                    for (col in 0 until roiWidth) {
+                        val pixelPos = validRoi.left * pixelStride + col * pixelStride
+                        if (pixelPos < rowBuffer.size) {
+                            croppedBuffer.put(rowBuffer[pixelPos])
+                        }
+                    }
+                }
+            } finally {
+                // Restore original buffer position
+                yBuffer.position(originalPos)
+            }
+
+            croppedBuffer.rewind()
+            return croppedBuffer
         }
 
         // Helper function to convert orientation enum to rotation degrees

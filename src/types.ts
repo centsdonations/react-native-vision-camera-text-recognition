@@ -98,6 +98,12 @@ export enum ImageOrientation {
 
 export interface ScanTextOptions {
   orientation?: ImageOrientation;
+  roi?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 export type TextRecognitionPlugin = {
