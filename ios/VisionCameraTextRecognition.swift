@@ -7,6 +7,15 @@ import MLKitTextRecognitionDevanagari
 import MLKitTextRecognitionJapanese
 import MLKitTextRecognitionKorean
 import MLKitCommon
+import CoreImage
+import UIKit
+import AVFoundation
+
+struct GrayscaleImageData {
+    let pixelBuffer: CVPixelBuffer
+    let width: Int
+    let height: Int
+}
 
 @objc(VisionCameraTextRecognition)
 public class VisionCameraTextRecognition: FrameProcessorPlugin {
@@ -39,20 +48,43 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
 
 
     public override func callback(_ frame: Frame, withArguments arguments: [AnyHashable: Any]?) -> Any {
-        let buffer = frame.buffer
-        let image = VisionImage(buffer: buffer)
 
+        let orientation: UIImage.Orientation
         // Check if orientation override is provided in arguments
         if let orientationOverride = arguments?["orientation"] as? Int,
            let visionOrientation = imageOrientationFromInt(orientationOverride) {
-            image.orientation = visionOrientation
+            orientation = visionOrientation
         } else {
             // Use default orientation if no override provided
-           image.orientation = getOrientation(orientation: frame.orientation)
+           orientation = getOrientation(orientation: frame.orientation)
         }
 
+        let roi = extractRegionOfInterest(arguments: arguments)
+        let visionImage: VisionImage
+        
+        if let roi = roi {
+            // Crop and convert to grayscale if ROI is provided
+            guard let grayscaleData = cropAndConvertToGrayscale(sampleBuffer: frame.buffer, cropRect: roi) else {
+                print("Failed to crop and convert image")
+                return [:]
+            }
+            
+            // Create VisionImage from the cropped grayscale buffer using a UIImage as intermediary
+            let ciImage = CIImage(cvPixelBuffer: grayscaleData.pixelBuffer)
+            let context = CIContext(options: nil)
+            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+                return [:]
+            }
+            let uiImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: orientation)
+            visionImage = VisionImage(image: uiImage)
+        } else {
+            // Use the original frame if no ROI
+            visionImage = VisionImage(buffer: frame.buffer)
+        }
+
+        
         do {
-            let result = try self.textRecognizer.results(in: image)
+            let result = try self.textRecognizer.results(in: visionImage)
             let blocks = VisionCameraTextRecognition.processBlocks(blocks: result.blocks)
             data["resultText"] = result.text
             data["blocks"] = blocks
@@ -65,6 +97,136 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
             print("Failed to recognize text: \(error.localizedDescription).")
             return [:]
         }
+    }
+
+    private func extractRegionOfInterest(arguments: [AnyHashable: Any]?) -> CGRect? {
+        guard let arguments = arguments,
+              let roiDict = arguments["roi"] as? [String: Any],
+              let x = roiDict["x"] as? CGFloat,
+              let y = roiDict["y"] as? CGFloat,
+              let width = roiDict["width"] as? CGFloat,
+              let height = roiDict["height"] as? CGFloat else {
+            return nil
+        }
+        
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func cropAndConvertToGrayscale(sampleBuffer: CMSampleBuffer, cropRect: CGRect) -> GrayscaleImageData? {
+        // Extract the pixel buffer from the sample buffer
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return nil
+        }
+        
+        // Lock the buffer for reading
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+        
+        // Get input dimensions
+        let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
+        
+        // Ensure crop rectangle is within image bounds
+        let validCropRect = CGRect(
+            x: max(0, cropRect.minX),
+            y: max(0, cropRect.minY),
+            width: min(CGFloat(imageWidth) - cropRect.minX, cropRect.width),
+            height: min(CGFloat(imageHeight) - cropRect.minY, cropRect.height)
+        )
+        
+        let outputWidth = Int(validCropRect.width)
+        let outputHeight = Int(validCropRect.height)
+        
+        // Create a new pixel buffer for the grayscale output
+        var newPixelBuffer: CVPixelBuffer?
+        let pixelBufferAttributes = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ] as CFDictionary
+        
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            outputWidth,
+            outputHeight,
+            kCVPixelFormatType_OneComponent8, // 8-bit grayscale
+            pixelBufferAttributes,
+            &newPixelBuffer
+        )
+        
+        guard status == kCVReturnSuccess, let outputBuffer = newPixelBuffer else {
+            return nil
+        }
+        
+        // Lock the output buffer for writing
+        CVPixelBufferLockBaseAddress(outputBuffer, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(outputBuffer, [])
+        }
+        
+        // Get the base address of both buffers
+        guard let inputBaseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
+              let outputBaseAddress = CVPixelBufferGetBaseAddress(outputBuffer) else {
+            return nil
+        }
+        
+        // Get strides for each buffer
+        let inputBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let outputBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
+        
+        // Get pixel format
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        
+        // Extract the Y plane (grayscale) from YUV format or convert RGB to grayscale
+        for y in 0..<outputHeight {
+            let srcY = Int(validCropRect.minY) + y
+            let srcRowOffset = srcY * inputBytesPerRow
+            let dstRowOffset = y * outputBytesPerRow
+            
+            for x in 0..<outputWidth {
+                let srcX = Int(validCropRect.minX) + x
+                
+                var grayValue: UInt8 = 0
+                
+                // Different handling based on pixel format
+                if pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                   pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                    // This is NV12 format (commonly used in iOS camera frames)
+                    // Y plane is the first plane and contains grayscale values directly
+                    
+                    if CVPixelBufferGetPlaneCount(pixelBuffer) > 0 {
+                        // Get the Y plane
+                        let yPlaneBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
+                        let yPlaneBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+                        
+                        // Extract the Y value
+                        let yOffset = srcY * yPlaneBytesPerRow + srcX
+                        grayValue = yPlaneBaseAddress!.advanced(by: yOffset).load(as: UInt8.self)
+                    }
+                } else if pixelFormat == kCVPixelFormatType_32BGRA {
+                    // For BGRA format, need to convert RGB to grayscale
+                    let pixelOffset = srcRowOffset + srcX * 4
+                    let b = inputBaseAddress.advanced(by: pixelOffset).load(as: UInt8.self)
+                    let g = inputBaseAddress.advanced(by: pixelOffset + 1).load(as: UInt8.self)
+                    let r = inputBaseAddress.advanced(by: pixelOffset + 2).load(as: UInt8.self)
+                    
+                    // Standard RGB to grayscale conversion
+                    // Y = 0.299*R + 0.587*G + 0.114*B
+                    grayValue = UInt8(min(max(0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(b), 0), 255))
+                }
+                
+                // Write the grayscale value to the output buffer
+                let outputOffset = dstRowOffset + x
+                outputBaseAddress.advanced(by: outputOffset).storeBytes(of: grayValue, as: UInt8.self)
+            }
+        }
+        
+        return GrayscaleImageData(
+            pixelBuffer: outputBuffer,
+            width: outputWidth,
+            height: outputHeight
+        )
     }
 
       static func processBlocks(blocks:[TextBlock]) -> Array<Any> {
