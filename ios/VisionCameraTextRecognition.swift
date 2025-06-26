@@ -10,6 +10,7 @@ import MLKitCommon
 import CoreImage
 import UIKit
 import AVFoundation
+import Accelerate
 
 struct GrayscaleImageData {
     let pixelBuffer: CVPixelBuffer
@@ -27,6 +28,14 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
     private static let japaneseOptions = JapaneseTextRecognizerOptions()
     private static let koreanOptions = KoreanTextRecognizerOptions()
     private var data: [String: Any] = [:]
+    
+    // Cache CIContext for better performance
+    private lazy var ciContext: CIContext = {
+        return CIContext(options: [
+            .useSoftwareRenderer: false,
+            .highQualityDownsample: false
+        ])
+    }()
 
 
     public override init(proxy: VisionCameraProxyHolder, options: [AnyHashable: Any]! = [:]) {
@@ -64,24 +73,24 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
         
         if let roi = roi {
             // Crop and convert to grayscale if ROI is provided
-            guard let grayscaleData = cropAndConvertToGrayscale(sampleBuffer: frame.buffer, cropRect: roi) else {
+            guard let croppedPixelBuffer = cropAndConvertToGrayscale(sampleBuffer: frame.buffer, cropRect: roi) else {
                 print("Failed to crop and convert image")
                 return [:]
             }
             
-            // Create VisionImage from the cropped grayscale buffer using a UIImage as intermediary
-            let ciImage = CIImage(cvPixelBuffer: grayscaleData.pixelBuffer)
-            let context = CIContext(options: nil)
-            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            // Create VisionImage from CVPixelBuffer via optimized UIImage conversion
+            guard let visionImg = createVisionImageFromPixelBuffer(croppedPixelBuffer, orientation: orientation) else {
+                print("Failed to create VisionImage from cropped pixel buffer")
                 return [:]
             }
-            let uiImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: orientation)
-            visionImage = VisionImage(image: uiImage)
+            
+            visionImage = visionImg
+            // Orientation is already set in createVisionImageFromPixelBuffer
         } else {
             // Use the original frame if no ROI
             visionImage = VisionImage(buffer: frame.buffer)
+            visionImage.orientation = orientation
         }
-
         
         do {
             let result = try self.textRecognizer.results(in: visionImage)
@@ -101,18 +110,23 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
 
     private func extractRegionOfInterest(arguments: [AnyHashable: Any]?) -> CGRect? {
         guard let arguments = arguments,
-              let roiDict = arguments["roi"] as? [String: Any],
-              let x = roiDict["x"] as? CGFloat,
-              let y = roiDict["y"] as? CGFloat,
-              let width = roiDict["width"] as? CGFloat,
-              let height = roiDict["height"] as? CGFloat else {
+              let roiDict = arguments["roi"] as? [String: Any] else {
             return nil
         }
         
-        return CGRect(x: x, y: y, width: width, height: height)
+        // Handle different number types (Int, Double, CGFloat)
+        guard let x = (roiDict["x"] as? NSNumber)?.doubleValue,
+              let y = (roiDict["y"] as? NSNumber)?.doubleValue,
+              let width = (roiDict["width"] as? NSNumber)?.doubleValue,
+              let height = (roiDict["height"] as? NSNumber)?.doubleValue,
+              width > 0, height > 0 else {
+            return nil
+        }
+        
+        return CGRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(width), height: CGFloat(height))
     }
 
-    private func cropAndConvertToGrayscale(sampleBuffer: CMSampleBuffer, cropRect: CGRect) -> GrayscaleImageData? {
+    private func cropAndConvertToGrayscale(sampleBuffer: CMSampleBuffer, cropRect: CGRect) -> CVPixelBuffer? {
         // Extract the pixel buffer from the sample buffer
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             return nil
@@ -128,29 +142,35 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
         let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
         let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
         
-        // Ensure crop rectangle is within image bounds
+        // Ensure crop rectangle is within image bounds and has valid dimensions
         let validCropRect = CGRect(
-            x: max(0, cropRect.minX),
-            y: max(0, cropRect.minY),
-            width: min(CGFloat(imageWidth) - cropRect.minX, cropRect.width),
-            height: min(CGFloat(imageHeight) - cropRect.minY, cropRect.height)
+            x: max(0, min(cropRect.minX, CGFloat(imageWidth - 1))),
+            y: max(0, min(cropRect.minY, CGFloat(imageHeight - 1))),
+            width: min(max(1, cropRect.width), CGFloat(imageWidth) - max(0, cropRect.minX)),
+            height: min(max(1, cropRect.height), CGFloat(imageHeight) - max(0, cropRect.minY))
         )
         
         let outputWidth = Int(validCropRect.width)
         let outputHeight = Int(validCropRect.height)
         
-        // Create a new pixel buffer for the grayscale output
+        // Ensure we have valid dimensions
+        guard outputWidth > 0 && outputHeight > 0 else {
+            return nil
+        }
+        
+        // Create a new pixel buffer for the grayscale output using YUV420 format (optimized for MLKit)
         var newPixelBuffer: CVPixelBuffer?
         let pixelBufferAttributes = [
             kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
         
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
             outputWidth,
             outputHeight,
-            kCVPixelFormatType_OneComponent8, // 8-bit grayscale
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, // YUV420 format like the input
             pixelBufferAttributes,
             &newPixelBuffer
         )
@@ -165,68 +185,87 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
             CVPixelBufferUnlockBaseAddress(outputBuffer, [])
         }
         
-        // Get the base address of both buffers
-        guard let inputBaseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
-              let outputBaseAddress = CVPixelBufferGetBaseAddress(outputBuffer) else {
-            return nil
-        }
-        
-        // Get strides for each buffer
-        let inputBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-        let outputBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
-        
-        // Get pixel format
+        // Get pixel format to handle different input formats efficiently
         let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
         
-        // Extract the Y plane (grayscale) from YUV format or convert RGB to grayscale
-        for y in 0..<outputHeight {
-            let srcY = Int(validCropRect.minY) + y
-            let srcRowOffset = srcY * inputBytesPerRow
-            let dstRowOffset = y * outputBytesPerRow
+        // Handle YUV formats efficiently by directly copying Y plane
+        if pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+           pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
             
-            for x in 0..<outputWidth {
-                let srcX = Int(validCropRect.minX) + x
-                
-                var grayValue: UInt8 = 0
-                
-                // Different handling based on pixel format
-                if pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-                   pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-                    // This is NV12 format (commonly used in iOS camera frames)
-                    // Y plane is the first plane and contains grayscale values directly
-                    
-                    if CVPixelBufferGetPlaneCount(pixelBuffer) > 0 {
-                        // Get the Y plane
-                        let yPlaneBaseAddress = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)
-                        let yPlaneBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-                        
-                        // Extract the Y value
-                        let yOffset = srcY * yPlaneBytesPerRow + srcX
-                        grayValue = yPlaneBaseAddress!.advanced(by: yOffset).load(as: UInt8.self)
-                    }
-                } else if pixelFormat == kCVPixelFormatType_32BGRA {
-                    // For BGRA format, need to convert RGB to grayscale
-                    let pixelOffset = srcRowOffset + srcX * 4
-                    let b = inputBaseAddress.advanced(by: pixelOffset).load(as: UInt8.self)
-                    let g = inputBaseAddress.advanced(by: pixelOffset + 1).load(as: UInt8.self)
-                    let r = inputBaseAddress.advanced(by: pixelOffset + 2).load(as: UInt8.self)
-                    
-                    // Standard RGB to grayscale conversion
-                    // Y = 0.299*R + 0.587*G + 0.114*B
-                    grayValue = UInt8(min(max(0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(b), 0), 255))
-                }
-                
-                // Write the grayscale value to the output buffer
-                let outputOffset = dstRowOffset + x
-                outputBaseAddress.advanced(by: outputOffset).storeBytes(of: grayValue, as: UInt8.self)
+            // NV12 format - Y plane is separate, much more efficient
+            guard CVPixelBufferGetPlaneCount(pixelBuffer) > 0,
+                  CVPixelBufferGetPlaneCount(outputBuffer) > 0,
+                  let yPlaneInput = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+                  let yPlaneOutput = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 0),
+                  let uvPlaneOutput = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 1) else {
+                return nil
             }
+            
+            let inputBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            let outputBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 0)
+            let uvOutputBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 1)
+            
+            let inputPtr = yPlaneInput.assumingMemoryBound(to: UInt8.self)
+            let outputPtr = yPlaneOutput.assumingMemoryBound(to: UInt8.self)
+            let uvOutputPtr = uvPlaneOutput.assumingMemoryBound(to: UInt8.self)
+            
+            // Copy Y plane data efficiently using row-by-row memcpy (much faster than pixel-by-pixel)
+            // For even better performance on supported devices, we could use vImage here
+            for y in 0..<outputHeight {
+                let srcY = Int(validCropRect.minY) + y
+                let srcRowOffset = srcY * inputBytesPerRow + Int(validCropRect.minX)
+                let dstRowOffset = y * outputBytesPerRow
+                
+                // Copy entire row at once - MUCH faster than pixel-by-pixel
+                let srcPtr = inputPtr.advanced(by: srcRowOffset)
+                let dstPtr = outputPtr.advanced(by: dstRowOffset)
+                memcpy(dstPtr, srcPtr, outputWidth)
+            }
+            
+            // Fill UV plane with neutral values (128) for better grayscale output
+            let uvSize = CVPixelBufferGetHeightOfPlane(outputBuffer, 1) * uvOutputBytesPerRow
+            memset(uvOutputPtr, 128, uvSize)
+            
+        } else {
+            // Fallback for other formats - convert to grayscale
+            guard let inputBaseAddress = CVPixelBufferGetBaseAddress(pixelBuffer),
+                  let yPlaneOutput = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 0),
+                  let uvPlaneOutput = CVPixelBufferGetBaseAddressOfPlane(outputBuffer, 1) else {
+                return nil
+            }
+            
+            let inputBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            let outputBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 0)
+            let uvOutputBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(outputBuffer, 1)
+            
+            let inputPtr = inputBaseAddress.assumingMemoryBound(to: UInt8.self)
+            let outputPtr = yPlaneOutput.assumingMemoryBound(to: UInt8.self)
+            let uvOutputPtr = uvPlaneOutput.assumingMemoryBound(to: UInt8.self)
+            
+            // Convert BGRA to grayscale efficiently
+            for y in 0..<outputHeight {
+                let srcY = Int(validCropRect.minY) + y
+                let srcRowStart = srcY * inputBytesPerRow + Int(validCropRect.minX) * 4
+                let dstRowOffset = y * outputBytesPerRow
+                
+                for x in 0..<outputWidth {
+                    let pixelOffset = srcRowStart + x * 4
+                    let b = inputPtr[pixelOffset]
+                    let g = inputPtr[pixelOffset + 1]
+                    let r = inputPtr[pixelOffset + 2]
+                    
+                    // Optimized grayscale conversion using integer arithmetic
+                    let gray = (299 * Int(r) + 587 * Int(g) + 114 * Int(b)) / 1000
+                    outputPtr[dstRowOffset + x] = UInt8(min(max(gray, 0), 255))
+                }
+            }
+            
+            // Fill UV plane with neutral values
+            let uvSize = CVPixelBufferGetHeightOfPlane(outputBuffer, 1) * uvOutputBytesPerRow
+            memset(uvOutputPtr, 128, uvSize)
         }
         
-        return GrayscaleImageData(
-            pixelBuffer: outputBuffer,
-            width: outputWidth,
-            height: outputHeight
-        )
+        return outputBuffer
     }
 
       static func processBlocks(blocks:[TextBlock]) -> Array<Any> {
@@ -340,5 +379,17 @@ public class VisionCameraTextRecognition: FrameProcessorPlugin {
         case 8: return .rightMirrored
         default: return nil
         }
+    }
+    
+    // Optimized: Create VisionImage from CVPixelBuffer via UIImage
+    private func createVisionImageFromPixelBuffer(_ pixelBuffer: CVPixelBuffer, orientation: UIImage.Orientation) -> VisionImage? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            return nil
+        }
+        
+        let uiImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: orientation)
+        return VisionImage(image: uiImage)
     }
 }
