@@ -19,7 +19,16 @@ import com.mrousavy.camera.frameprocessors.Frame
 import com.mrousavy.camera.frameprocessors.FrameProcessorPlugin
 import com.mrousavy.camera.frameprocessors.VisionCameraProxy
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.max
+import kotlin.math.min
 import java.util.HashMap
+
+data class GrayscaleImageData(
+    val buffer: ByteBuffer,
+    val width: Int,
+    val height: Int
+)
 
 class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<String, Any>?) :
     FrameProcessorPlugin() {
@@ -51,13 +60,13 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
         val roi = extractRegionOfInterestParameter(arguments)
 
         val image = if (roi != null) {
-            val croppedBuffer = cropGrayscaleFromImage(mediaImage, roi)
+            val greyscaleImage = cropAndConvertToGrayscale(mediaImage, roi)
             InputImage.fromByteBuffer(
-                croppedBuffer,
-                roi.width(),
-                roi.height(),
+                greyscaleImage.buffer,
+                greyscaleImage.width,
+                greyscaleImage.height,
                 rotation,
-                InputImage.IMAGE_FORMAT_Y8
+                InputImage.IMAGE_FORMAT_NV21
             )
         } else {
             InputImage.fromMediaImage(mediaImage, rotation)
@@ -172,60 +181,103 @@ class VisionCameraTextRecognitionPlugin(proxy: VisionCameraProxy, options: Map<S
             return Rect(x, y, x + width, y + height)
         }
 
-        private fun cropGrayscaleFromImage(image: Image, roi: Rect): ByteBuffer {
+        fun cropAndConvertToGrayscale(
+            image: Image,
+            cropRect: android.graphics.Rect
+        ): GrayscaleImageData {
+            // Get the image planes (Y, U, V for YUV_420_888 format)
             val yPlane = image.planes[0]
-            val yBuffer = yPlane.buffer
-            val yRowStride = yPlane.rowStride
-            val pixelStride = yPlane.pixelStride
 
-            // Validate ROI boundaries
-            val imgWidth = image.width
-            val imgHeight = image.height
-            val validRoi = Rect(
-                max(0, roi.left),
-                max(0, roi.top),
-                min(imgWidth, roi.right),
-                min(imgHeight, roi.bottom)
+            // Original dimensions and strides
+            val imageWidth = image.width
+            val imageHeight = image.height
+            val yRowStride = yPlane.rowStride
+            val yPixelStride = yPlane.pixelStride
+
+            // Ensure crop rectangle is within image bounds
+            val validCropRect = android.graphics.Rect(
+                maxOf(0, cropRect.left),
+                maxOf(0, cropRect.top),
+                minOf(imageWidth, cropRect.right),
+                minOf(imageHeight, cropRect.bottom)
             )
 
-            val roiWidth = validRoi.width()
-            val roiHeight = validRoi.height()
+            // Output dimensions are the same as cropped dimensions
+            val outputWidth = validCropRect.width()
+            val outputHeight = validCropRect.height()
 
-            // Create a properly ordered direct buffer
-            val croppedBuffer = ByteBuffer.allocateDirect(roiWidth * roiHeight)
-                .order(ByteOrder.nativeOrder())
+            // Safe buffer size calculation
+            val ySize = outputWidth.toLong() * outputHeight.toLong()
+            val uvSize = ySize / 2
+            val totalSize = ySize + uvSize
 
-            // Create a temporary buffer for reading each row
-            val rowBuffer = ByteArray(yRowStride)
+            // Check for integer overflow
+            if (totalSize > Int.MAX_VALUE) {
+                throw IllegalArgumentException("Image dimensions too large: ${outputWidth}x${outputHeight}")
+            }
 
-            // Save original buffer position
-            val originalPos = yBuffer.position()
+            // Create output buffer for NV21 data
+            val outputBuffer = ByteBuffer.allocateDirect(totalSize.toInt())
 
-            try {
-                for (row in 0 until roiHeight) {
-                    val rowOffset = (validRoi.top + row) * yRowStride
+            // Get the Y plane buffer
+            val yBuffer = yPlane.buffer
+            val yBufferSize = yBuffer.remaining()
 
-                    // Set buffer position just once per row
-                    yBuffer.position(rowOffset)
+            // Extract and copy Y plane (grayscale)
+            var outputPos = 0
+            for (y in 0 until outputHeight) {
+                val sourceY = validCropRect.top + y
+                val sourceRowOffset = sourceY * yRowStride
 
-                    // Read the entire row
-                    yBuffer.get(rowBuffer, 0, min(yRowStride, yBuffer.remaining()))
+                for (x in 0 until outputWidth) {
+                    val sourceX = validCropRect.left + x
+                    val sourceIndex = sourceRowOffset + sourceX * yPixelStride
 
-                    // Extract only the pixels we need, accounting for pixel stride
-                    for (col in 0 until roiWidth) {
-                        val pixelPos = validRoi.left * pixelStride + col * pixelStride
-                        if (pixelPos < rowBuffer.size) {
-                            croppedBuffer.put(rowBuffer[pixelPos])
+                    // Safety check for source buffer
+                    if (sourceIndex < yBufferSize) {
+                        // Safety check for output buffer
+                        if (outputPos < ySize.toInt()) {
+                            yBuffer.position(sourceIndex)
+                            val gray = yBuffer.get()
+                            outputBuffer.put(outputPos, gray)
+                            outputPos++
+                        } else {
+                            throw IndexOutOfBoundsException("Y plane write exceeds buffer capacity")
+                        }
+                    } else {
+                        // Default value if out of bounds
+                        if (outputPos < ySize.toInt()) {
+                            outputBuffer.put(outputPos, 0)
+                            outputPos++
+                        } else {
+                            throw IndexOutOfBoundsException("Y plane write exceeds buffer capacity")
                         }
                     }
                 }
-            } finally {
-                // Restore original buffer position
-                yBuffer.position(originalPos)
             }
 
-            croppedBuffer.rewind()
-            return croppedBuffer
+            // Fill the UV plane with neutral values (128) for grayscale
+            val uvPlaneStart = ySize.toInt()
+            val uvPlaneSize = uvSize.toInt()
+
+            // Safety check for UV plane size
+            if (uvPlaneStart + uvPlaneSize > totalSize.toInt()) {
+                throw IndexOutOfBoundsException("UV plane exceeds buffer capacity")
+            }
+
+            // Fill UV plane with neutral values
+            for (i in 0 until uvPlaneSize) {
+                outputBuffer.put(uvPlaneStart + i, 128.toByte())
+            }
+
+            // Reset position to beginning for reading
+            outputBuffer.rewind()
+
+            return GrayscaleImageData(
+                buffer = outputBuffer,
+                width = outputWidth,
+                height = outputHeight
+            )
         }
 
         // Helper function to convert orientation enum to rotation degrees
